@@ -38,3 +38,7 @@ Driift solves the issue of static cameras during presentations, lectures, or sol
 1. Install the required dependencies:
    ```bash
    pip install -r requirements.txt
+
+2. Run the Python backend:
+   ```bash
+   py main.py
