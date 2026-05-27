@@ -37,6 +37,10 @@ LOOKING_SCORE_THRESHOLD = 0.45
 SUBJECT_DEADBAND_PX = 12   # Ignore tiny jitter under this pixel distance.
 SUBJECT_SMOOTHING_ALPHA = 0.25  # Lower value = smoother, less responsive.
 SUBJECT_REACQUIRE_PX = 80   # Snap quickly if target jumps a large distance.
+GIMBAL_DEADBAND_RATIO = 0.03  # Ignore tiny center errors (<3% of frame half-size).
+GIMBAL_GAIN_X = 0.8
+GIMBAL_GAIN_Y = 0.8
+GIMBAL_MAX_OUTPUT = 1.0  # Output command range is [-1.0, 1.0].
 
 subject_track_id = None
 subject_stable_center = None
@@ -139,6 +143,33 @@ def stabilize_subject_center(previous_center, detected_center):
     smooth_y = int(prev_y + SUBJECT_SMOOTHING_ALPHA * dy)
     return (smooth_x, smooth_y)
 
+def compute_gimbal_output(subject_center, frame_w, frame_h):
+    """
+    Returns normalized gimbal movement commands:
+    - move_x: negative=left, positive=right
+    - move_y: negative=up, positive=down
+    """
+    if subject_center is None:
+        return 0.0, 0.0
+
+    center_x, center_y = subject_center
+    frame_center_x = frame_w / 2.0
+    frame_center_y = frame_h / 2.0
+    half_w = max(frame_w / 2.0, 1.0)
+    half_h = max(frame_h / 2.0, 1.0)
+
+    err_x = (center_x - frame_center_x) / half_w
+    err_y = (center_y - frame_center_y) / half_h
+
+    if abs(err_x) < GIMBAL_DEADBAND_RATIO:
+        err_x = 0.0
+    if abs(err_y) < GIMBAL_DEADBAND_RATIO:
+        err_y = 0.0
+
+    move_x = float(np.clip(err_x * GIMBAL_GAIN_X, -GIMBAL_MAX_OUTPUT, GIMBAL_MAX_OUTPUT))
+    move_y = float(np.clip(err_y * GIMBAL_GAIN_Y, -GIMBAL_MAX_OUTPUT, GIMBAL_MAX_OUTPUT))
+    return move_x, move_y
+
 while cap.isOpened():
     success, frame = cap.read()
     if not success:
@@ -198,6 +229,8 @@ while cap.isOpened():
                 cv2.FONT_HERSHEY_SIMPLEX, 1, text_color, 2)
 
     coordinate_lines = []
+    gimbal_output = (0.0, 0.0)
+    frame_h, frame_w = frame.shape[:2]
 
     if not is_paused:
         results = model.track(frame, persist=True, classes=0, conf=0.8, iou=0.5, verbose=False) 
@@ -209,7 +242,6 @@ while cap.isOpened():
             if results[0].keypoints is not None and results[0].keypoints.xy is not None:
                 keypoints_xy = results[0].keypoints.xy.cpu().numpy()
 
-            frame_h, frame_w = frame.shape[:2]
             best_subject_id = None
             best_subject_score = -1.0
             candidate_scores = {}
@@ -261,6 +293,7 @@ while cap.isOpened():
                 if is_subject:
                     subject_stable_center = stabilize_subject_center(subject_stable_center, (center_x, center_y))
                     display_x, display_y = subject_stable_center
+                    gimbal_output = compute_gimbal_output((display_x, display_y), frame_w, frame_h)
 
                 cv2.circle(frame, (display_x, display_y), 5, color, -1)
                 cv2.putText(frame, f"{label_prefix} ({display_x}, {display_y})",
@@ -270,16 +303,24 @@ while cap.isOpened():
                     f"{label_prefix}: ({display_x}, {display_y}) facing={facing_score:.2f}"
                 )
         else:
+            subject_track_id = None
             subject_stable_center = None
+            gimbal_output = (0.0, 0.0)
     else:
+        subject_track_id = None
         subject_stable_center = None
+        gimbal_output = (0.0, 0.0)
+
+    move_x, move_y = gimbal_output
+    cv2.putText(frame, f"GIMBAL x:{move_x:+.2f} y:{move_y:+.2f}",
+                (20, 75), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2)
 
     if is_paused:
-        print("TRACKING PAUSED")
+        print("TRACKING PAUSED | GIMBAL x:+0.00 y:+0.00")
     elif coordinate_lines:
-        print(" | ".join(coordinate_lines))
+        print(" | ".join(coordinate_lines) + f" | GIMBAL x:{move_x:+.2f} y:{move_y:+.2f}")
     else:
-        print("No tracked coordinates")
+        print("No tracked coordinates | GIMBAL x:+0.00 y:+0.00")
 
     cv2.imshow("Person Tracker (Filtered)", frame)
 
