@@ -170,6 +170,52 @@ def compute_gimbal_output(subject_center, frame_w, frame_h):
     move_y = float(np.clip(err_y * GIMBAL_GAIN_Y, -GIMBAL_MAX_OUTPUT, GIMBAL_MAX_OUTPUT))
     return move_x, move_y
 
+def get_nose_point(keypoints):
+    """Returns (x, y) for nose keypoint if valid, else None."""
+    if keypoints is None or len(keypoints) == 0:
+        return None
+    nose = keypoints[0]
+    if np.any(nose <= 0):
+        return None
+    return int(nose[0]), int(nose[1])
+
+def get_torso_center_point(keypoints):
+    """
+    Returns (x, y) for the torso center using pose keypoints if valid, else None.
+    Uses shoulders (5,6) and hips (11,12) when available; falls back to shoulders-only.
+    """
+    if keypoints is None or len(keypoints) == 0:
+        return None
+
+    def valid_xy(kp):
+        return kp is not None and not np.any(kp <= 0)
+
+    left_shoulder = keypoints[5] if len(keypoints) > 6 else None
+    right_shoulder = keypoints[6] if len(keypoints) > 6 else None
+    left_hip = keypoints[11] if len(keypoints) > 12 else None
+    right_hip = keypoints[12] if len(keypoints) > 12 else None
+
+    points = []
+    for kp in (left_shoulder, right_shoulder, left_hip, right_hip):
+        if kp is not None and valid_xy(kp):
+            points.append(kp)
+
+    if len(points) >= 3:
+        xs = [p[0] for p in points]
+        ys = [p[1] for p in points]
+        return int(sum(xs) / len(xs)), int(sum(ys) / len(ys))
+
+    shoulder_points = []
+    for kp in (left_shoulder, right_shoulder):
+        if kp is not None and valid_xy(kp):
+            shoulder_points.append(kp)
+    if len(shoulder_points) == 2:
+        x = int((shoulder_points[0][0] + shoulder_points[1][0]) / 2.0)
+        y = int((shoulder_points[0][1] + shoulder_points[1][1]) / 2.0)
+        return x, y
+
+    return None
+
 while cap.isOpened():
     success, frame = cap.read()
     if not success:
@@ -249,14 +295,18 @@ while cap.isOpened():
             for idx, (box, track_id) in enumerate(zip(boxes, track_ids)):
                 x, y, w, h = box
                 center_x, center_y = int(x), int(y)
+                nose_x, nose_y = center_x, center_y
 
                 facing_score = 0.0
                 if keypoints_xy is not None and idx < len(keypoints_xy):
                     facing_score = get_facing_camera_score(keypoints_xy[idx])
+                    nose_point = get_nose_point(keypoints_xy[idx])
+                    if nose_point is not None:
+                        nose_x, nose_y = nose_point
 
                 area_score = min((w * h) / float(frame_w * frame_h * 0.35), 1.0)
-                center_dist_x = abs(center_x - (frame_w // 2)) / max(frame_w // 2, 1)
-                center_dist_y = abs(center_y - (frame_h // 2)) / max(frame_h // 2, 1)
+                center_dist_x = abs(nose_x - (frame_w // 2)) / max(frame_w // 2, 1)
+                center_dist_y = abs(nose_y - (frame_h // 2)) / max(frame_h // 2, 1)
                 center_score = max(0.0, 1.0 - 0.6 * center_dist_x - 0.4 * center_dist_y)
 
                 subject_score = 0.65 * facing_score + 0.20 * area_score + 0.15 * center_score
@@ -282,8 +332,12 @@ while cap.isOpened():
                 x, y, w, h = box
                 center_x, center_y = int(x), int(y)
                 facing_score = 0.0
+                nose_point = None
+                torso_point = None
                 if keypoints_xy is not None and idx < len(keypoints_xy):
                     facing_score = get_facing_camera_score(keypoints_xy[idx])
+                    nose_point = get_nose_point(keypoints_xy[idx])
+                    torso_point = get_torso_center_point(keypoints_xy[idx])
 
                 is_subject = track_id == subject_track_id
                 color = (0, 255, 255) if is_subject else (0, 255, 0)
@@ -291,9 +345,15 @@ while cap.isOpened():
 
                 display_x, display_y = center_x, center_y
                 if is_subject:
-                    subject_stable_center = stabilize_subject_center(subject_stable_center, (center_x, center_y))
-                    display_x, display_y = subject_stable_center
+                    if nose_point is not None:
+                        display_x, display_y = nose_point
+                    else:
+                        display_x, display_y = center_x, center_y
+                    subject_stable_center = (display_x, display_y)
                     gimbal_output = compute_gimbal_output((display_x, display_y), frame_w, frame_h)
+                else:
+                    if torso_point is not None:
+                        display_x, display_y = torso_point
 
                 cv2.circle(frame, (display_x, display_y), 5, color, -1)
                 cv2.putText(frame, f"{label_prefix} ({display_x}, {display_y})",
