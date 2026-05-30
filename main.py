@@ -2,6 +2,8 @@ import cv2
 import numpy as np
 import mediapipe as mp
 from ultralytics import YOLO
+import sys
+import time
 
 # Load the YOLO pose model (person boxes + body keypoints)
 model = YOLO('yolov8n-pose.pt')
@@ -22,17 +24,37 @@ options = HandLandmarkerOptions(
 )
 landmarker = HandLandmarker.create_from_options(options)
 
-cap = cv2.VideoCapture(1)
+def open_camera(preferred_indices=(1, 0, 2, 3)):
+    """Try camera indices in order and return the first working capture."""
+    for cam_idx in preferred_indices:
+        cap_candidate = cv2.VideoCapture(cam_idx)
+        if cap_candidate is not None and cap_candidate.isOpened():
+            print(f"Using camera index {cam_idx}")
+            return cap_candidate
+        if cap_candidate is not None:
+            cap_candidate.release()
+    return None
+
+cap = open_camera()
+if cap is None:
+    print("ERROR: Could not open any camera device. Try connecting a camera or changing indices.")
+    landmarker.close()
+    sys.exit(1)
 
 # State variables for the tracking toggle
 is_paused = False
-fist_cooldown = 0  # Prevents rapid flickering between pause/resume
+gimbal_frozen = False
+frozen_gimbal_output = (0.0, 0.0)
+gimbal_freeze_capture = False  # Latch current gimbal output on next frame after peace sign.
+gesture_cooldown = 0  # Prevents rapid flickering between gestures
 fist_hold_frames = 0  # Requires a stable fist for multiple frames
 open_hold_frames = 0  # Requires a stable open hand for resume
+peace_hold_frames = 0  # Requires a stable peace sign to freeze/unfreeze gimbal
 
 FULL_HAND_MIN_SPAN = 0.25
 FIST_HOLD_FRAMES = 4
 OPEN_HOLD_FRAMES = 3
+PEACE_HOLD_FRAMES = 4
 LOOKING_SCORE_THRESHOLD = 0.45
 SUBJECT_DEADBAND_PX = 12   # Ignore tiny jitter under this pixel distance.
 SUBJECT_SMOOTHING_ALPHA = 0.25  # Lower value = smoother, less responsive.
@@ -44,6 +66,21 @@ GIMBAL_MAX_OUTPUT = 1.0  # Output command range is [-1.0, 1.0].
 
 subject_track_id = None
 subject_stable_center = None
+
+# HUD / telemetry state
+fps_value = 0.0
+fps_frame_count = 0
+fps_last_tick = time.perf_counter()
+fake_battery_pct = 92.0
+battery_last_tick = time.perf_counter()
+HUD_ACCENT = (0, 255, 255)
+HUD_DIM = (170, 170, 170)
+HUD_WARN = (0, 140, 255)
+HUD_ALERT = (0, 0, 255)
+STARTUP_SCAN_DURATION = 2.75
+STARTUP_IDENTIFY_DURATION = 1.35
+startup_scan_active = True
+startup_t0 = time.perf_counter()
 
 def is_fist(hand_landmarks):
     """Detects a fist by checking if fingers are curled into the palm."""
@@ -68,6 +105,30 @@ def is_open_hand(hand_landmarks):
             extended_fingers += 1
 
     return extended_fingers >= 4
+
+def is_finger_extended(hand_landmarks, tip_idx, pip_idx):
+    return hand_landmarks[tip_idx].y < hand_landmarks[pip_idx].y
+
+def is_finger_folded(hand_landmarks, tip_idx, pip_idx):
+    return hand_landmarks[tip_idx].y > hand_landmarks[pip_idx].y
+
+def is_peace_sign(hand_landmarks):
+    """Two fingers up (index + middle), ring and pinky down."""
+    if is_fist(hand_landmarks) or is_open_hand(hand_landmarks):
+        return False
+
+    index_up = is_finger_extended(hand_landmarks, 8, 6)
+    middle_up = is_finger_extended(hand_landmarks, 12, 10)
+    ring_down = is_finger_folded(hand_landmarks, 16, 14)
+    pinky_down = is_finger_folded(hand_landmarks, 20, 18)
+    if not (index_up and middle_up and ring_down and pinky_down):
+        return False
+
+    # Fingertips should be above the folded fingers (peace sign pointing up).
+    index_tip = hand_landmarks[8]
+    middle_tip = hand_landmarks[12]
+    ring_tip = hand_landmarks[16]
+    return index_tip.y < ring_tip.y and middle_tip.y < ring_tip.y
 
 def is_full_hand_visible(hand_landmarks):
     """Checks that the hand is fully in frame and large enough to be reliable."""
@@ -216,11 +277,341 @@ def get_torso_center_point(keypoints):
 
     return None
 
+def get_startup_phase(elapsed):
+    if elapsed < STARTUP_SCAN_DURATION:
+        return "scan", elapsed / STARTUP_SCAN_DURATION
+    if elapsed < STARTUP_SCAN_DURATION + STARTUP_IDENTIFY_DURATION:
+        identify_elapsed = elapsed - STARTUP_SCAN_DURATION
+        return "identify", identify_elapsed / STARTUP_IDENTIFY_DURATION
+    return "done", 1.0
+
+def collect_cosmetic_targets(results, frame_w, frame_h):
+    """Fake scan hits from current detections (visual only)."""
+    targets = []
+    if results[0].boxes is None or results[0].boxes.id is None:
+        return targets
+
+    boxes = results[0].boxes.xywh.cpu().numpy()
+    track_ids = results[0].boxes.id.int().cpu().numpy().tolist()
+    keypoints_xy = None
+    if results[0].keypoints is not None and results[0].keypoints.xy is not None:
+        keypoints_xy = results[0].keypoints.xy.cpu().numpy()
+
+    for idx, (box, track_id) in enumerate(zip(boxes, track_ids)):
+        x, y, w, h = box
+        tx, ty = int(x), int(y)
+        if keypoints_xy is not None and idx < len(keypoints_xy):
+            nose = get_nose_point(keypoints_xy[idx])
+            if nose is not None:
+                tx, ty = nose
+            else:
+                torso = get_torso_center_point(keypoints_xy[idx])
+                if torso is not None:
+                    tx, ty = torso
+        targets.append({"id": int(track_id), "x": tx, "y": ty})
+    return targets
+
+def draw_startup_laser_scan(frame, scan_progress, targets):
+    h, w = frame.shape[:2]
+    scan_y = int(np.clip(scan_progress, 0.0, 1.0) * h)
+    laser_core = (255, 255, 120)
+    laser_glow = HUD_ACCENT
+
+    overlay = frame.copy()
+    cv2.rectangle(overlay, (0, scan_y), (w, h), (0, 0, 0), -1)
+    cv2.addWeighted(overlay, 0.38, frame, 0.62, 0, frame)
+
+    for offset, thickness, color in ((0, 2, laser_core), (-4, 1, laser_glow), (4, 1, laser_glow)):
+        y = np.clip(scan_y + offset, 0, h - 1)
+        cv2.line(frame, (0, y), (w, y), color, thickness, cv2.LINE_AA)
+
+    for trail in range(1, 10):
+        ty = scan_y - trail * 7
+        if ty < 0:
+            break
+        fade = max(40, 180 - trail * 16)
+        cv2.line(frame, (0, ty), (w, ty), (fade, fade, 0), 1, cv2.LINE_AA)
+
+    pinged = 0
+    for target in targets:
+        if abs(target["y"] - scan_y) <= 22:
+            pinged += 1
+            cv2.circle(frame, (target["x"], target["y"]), 14, laser_glow, 2, cv2.LINE_AA)
+            cv2.circle(frame, (target["x"], target["y"]), 4, laser_core, -1, cv2.LINE_AA)
+            cv2.putText(
+                frame, f"SIG {target['id']:02d}",
+                (target["x"] + 16, target["y"] - 10),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.45, laser_glow, 1, cv2.LINE_AA,
+            )
+
+    status = "LASER SCAN: SEARCHING FOR SUBJECTS..."
+    cv2.putText(frame, status, (24, h - 42), cv2.FONT_HERSHEY_SIMPLEX, 0.62, laser_glow, 2, cv2.LINE_AA)
+    cv2.putText(
+        frame, f"Sweep {int(scan_progress * 100):3d}%  |  Hits {pinged}",
+        (24, h - 14), cv2.FONT_HERSHEY_SIMPLEX, 0.52, HUD_DIM, 1, cv2.LINE_AA,
+    )
+    cv2.putText(
+        frame, "DRIIFT BOOT SEQUENCE",
+        (24, 36), cv2.FONT_HERSHEY_SIMPLEX, 0.72, HUD_ACCENT, 2, cv2.LINE_AA,
+    )
+
+def draw_startup_identify(frame, identify_progress, targets):
+    h, w = frame.shape[:2]
+    overlay = frame.copy()
+    cv2.rectangle(overlay, (0, 0), (w, h), (0, 0, 0), -1)
+    cv2.addWeighted(overlay, 0.22, frame, 0.78, 0, frame)
+
+    visible_count = 0
+    for i, target in enumerate(targets):
+        reveal = np.clip((identify_progress * (len(targets) + 1)) - i, 0.0, 1.0)
+        if reveal <= 0.0:
+            continue
+        visible_count += 1
+        tx, ty = target["x"], target["y"]
+        box_half = int(24 + 8 * reveal)
+        alpha_color = (
+            int(HUD_ACCENT[0] * reveal),
+            int(HUD_ACCENT[1] * reveal),
+            int(HUD_ACCENT[2] * reveal),
+        )
+        x1, y1 = tx - box_half, ty - box_half
+        x2, y2 = tx + box_half, ty + box_half
+        cv2.rectangle(frame, (x1, y1), (x2, y2), alpha_color, 2, cv2.LINE_AA)
+        draw_lock_on_reticle(frame, tx, ty, locked=reveal > 0.65)
+        cv2.putText(
+            frame, f"ID {target['id']:02d} IDENTIFIED",
+            (x1, y1 - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.48, alpha_color, 1, cv2.LINE_AA,
+        )
+
+    cv2.putText(
+        frame, "SUBJECT IDENTIFICATION",
+        (24, 36), cv2.FONT_HERSHEY_SIMPLEX, 0.72, HUD_ACCENT, 2, cv2.LINE_AA,
+    )
+    label = "MAPPING TARGETS..." if identify_progress < 0.85 else "SUBJECTS IDENTIFIED"
+    cv2.putText(frame, label, (24, h - 24), cv2.FONT_HERSHEY_SIMPLEX, 0.62, HUD_ACCENT, 2, cv2.LINE_AA)
+    cv2.putText(
+        frame, f"Confirmed {visible_count}/{max(len(targets), 1)}",
+        (24, h - 52), cv2.FONT_HERSHEY_SIMPLEX, 0.52, HUD_DIM, 1, cv2.LINE_AA,
+    )
+
+def draw_startup_sequence(frame, phase, phase_progress, targets):
+    draw_cinematic_crosshair(frame)
+    if phase == "scan":
+        draw_startup_laser_scan(frame, phase_progress, targets)
+    elif phase == "identify":
+        draw_startup_identify(frame, phase_progress, targets)
+
+def get_tracking_mode_label(is_paused, gimbal_frozen, has_subject_lock):
+    if is_paused:
+        return "STANDBY"
+    if gimbal_frozen:
+        return "GIMBAL HOLD"
+    if has_subject_lock:
+        return "LOCKED"
+    return "SEARCHING"
+
+def update_fps_counter():
+    global fps_value, fps_frame_count, fps_last_tick
+    fps_frame_count += 1
+    now = time.perf_counter()
+    elapsed = now - fps_last_tick
+    if elapsed >= 0.5:
+        fps_value = fps_frame_count / elapsed
+        fps_frame_count = 0
+        fps_last_tick = now
+
+def update_fake_battery():
+    global fake_battery_pct, battery_last_tick
+    now = time.perf_counter()
+    elapsed = now - battery_last_tick
+    if elapsed < 1.0:
+        return
+    battery_last_tick = now
+    fake_battery_pct -= 0.04 * elapsed
+    if fake_battery_pct < 18.0:
+        fake_battery_pct = 88.0
+
+def draw_cinematic_crosshair(frame):
+    h, w = frame.shape[:2]
+    cx, cy = w // 2, h // 2
+    color = (210, 210, 210)
+    gap = 14
+    arm = min(w, h) // 5
+    thickness = 1
+
+    cv2.line(frame, (cx - arm, cy), (cx - gap, cy), color, thickness, cv2.LINE_AA)
+    cv2.line(frame, (cx + gap, cy), (cx + arm, cy), color, thickness, cv2.LINE_AA)
+    cv2.line(frame, (cx, cy - arm), (cx, cy - gap), color, thickness, cv2.LINE_AA)
+    cv2.line(frame, (cx, cy + gap), (cx, cy + arm), color, thickness, cv2.LINE_AA)
+    cv2.circle(frame, (cx, cy), 3, color, 1, cv2.LINE_AA)
+
+    inset = 28
+    corner = 34
+    for ox, oy, dx, dy in (
+        (inset, inset, 1, 1), (w - inset, inset, -1, 1),
+        (inset, h - inset, 1, -1), (w - inset, h - inset, -1, -1),
+    ):
+        cv2.line(frame, (ox, oy), (ox + dx * corner, oy), color, 1, cv2.LINE_AA)
+        cv2.line(frame, (ox, oy), (ox, oy + dy * corner), color, 1, cv2.LINE_AA)
+
+def draw_lock_on_reticle(frame, cx, cy, locked=True):
+    pulse = 0.85 + 0.15 * abs(np.sin(time.perf_counter() * 4.5))
+    size = int(34 * pulse)
+    color = HUD_ACCENT if locked else HUD_DIM
+    thickness = 2 if locked else 1
+    half = size // 2
+    gap = 7
+
+    x1, y1 = cx - half, cy - half
+    x2, y2 = cx + half, cy + half
+    cv2.rectangle(frame, (x1, y1), (x2, y2), color, 1, cv2.LINE_AA)
+
+    seg = half - gap
+    cv2.line(frame, (x1, y1), (x1 + seg, y1), color, thickness, cv2.LINE_AA)
+    cv2.line(frame, (x1, y1), (x1, y1 + seg), color, thickness, cv2.LINE_AA)
+    cv2.line(frame, (x2, y1), (x2 - seg, y1), color, thickness, cv2.LINE_AA)
+    cv2.line(frame, (x2, y1), (x2, y1 + seg), color, thickness, cv2.LINE_AA)
+    cv2.line(frame, (x1, y2), (x1 + seg, y2), color, thickness, cv2.LINE_AA)
+    cv2.line(frame, (x1, y2), (x1, y2 - seg), color, thickness, cv2.LINE_AA)
+    cv2.line(frame, (x2, y2), (x2 - seg, y2), color, thickness, cv2.LINE_AA)
+    cv2.line(frame, (x2, y2), (x2, y2 - seg), color, thickness, cv2.LINE_AA)
+
+    cv2.line(frame, (cx - 10, cy), (cx - 3, cy), color, 1, cv2.LINE_AA)
+    cv2.line(frame, (cx + 3, cy), (cx + 10, cy), color, 1, cv2.LINE_AA)
+    cv2.line(frame, (cx, cy - 10), (cx, cy - 3), color, 1, cv2.LINE_AA)
+    cv2.line(frame, (cx, cy + 3), (cx, cy + 10), color, 1, cv2.LINE_AA)
+
+def draw_battery_indicator(frame, battery_pct):
+    h, w = frame.shape[:2]
+    x, y = w - 150, 24
+    pct = int(np.clip(battery_pct, 0, 100))
+    label = f"PWR {pct:3d}%"
+    color = HUD_ACCENT if pct > 35 else HUD_WARN if pct > 20 else HUD_ALERT
+    cv2.putText(frame, label, (x, y), cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 1, cv2.LINE_AA)
+
+    bar_x, bar_y, bar_w, bar_h = x, y + 10, 110, 10
+    cv2.rectangle(frame, (bar_x, bar_y), (bar_x + bar_w, bar_y + bar_h), HUD_DIM, 1, cv2.LINE_AA)
+    fill_w = int(bar_w * (pct / 100.0))
+    if fill_w > 0:
+        cv2.rectangle(frame, (bar_x + 1, bar_y + 1), (bar_x + fill_w - 1, bar_y + bar_h - 1), color, -1, cv2.LINE_AA)
+
+def draw_hud_panel(frame, tracking_mode, target_confidence, fps, gimbal_xy, gimbal_frozen):
+    h, w = frame.shape[:2]
+    panel_h = 118
+    overlay = frame.copy()
+    cv2.rectangle(overlay, (0, 0), (w, panel_h), (0, 0, 0), -1)
+    cv2.addWeighted(overlay, 0.42, frame, 0.58, 0, frame)
+
+    mode_color = HUD_ACCENT
+    if tracking_mode == "STANDBY":
+        mode_color = HUD_ALERT
+    elif tracking_mode == "GIMBAL HOLD":
+        mode_color = HUD_WARN
+    elif tracking_mode == "SEARCHING":
+        mode_color = HUD_DIM
+
+    cv2.putText(frame, "DRIIFT TRACKING HUD", (16, 28),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.62, HUD_ACCENT, 1, cv2.LINE_AA)
+    cv2.putText(frame, f"MODE: {tracking_mode}", (16, 56),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.62, mode_color, 2, cv2.LINE_AA)
+    cv2.putText(frame, f"TARGET CONF: {target_confidence:5.1f}%", (16, 86),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.58, HUD_ACCENT, 1, cv2.LINE_AA)
+
+    move_x, move_y = gimbal_xy
+    gimbal_label = "GIMBAL HOLD" if gimbal_frozen else "GIMBAL LIVE"
+    gimbal_color = HUD_WARN if gimbal_frozen else (255, 255, 0)
+    cv2.putText(frame, f"{gimbal_label}  x:{move_x:+.2f}  y:{move_y:+.2f}", (290, 56),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.55, gimbal_color, 1, cv2.LINE_AA)
+
+    cv2.putText(frame, f"FPS {fps:4.1f}", (w - 96, h - 18),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.52, HUD_DIM, 1, cv2.LINE_AA)
+
+def draw_gimbal_pause_minimap(frame, frame_w, frame_h, subject_point, gimbal_xy):
+    """
+    Corner tactical map shown only while gimbal is frozen (peace-sign hold).
+    Shows subject position, camera command direction, and tracking cone.
+    """
+    h, w = frame.shape[:2]
+    map_w, map_h = 132, 108
+    margin = 14
+    x0, y0 = margin, h - map_h - margin
+    pad = 10
+    inner_x = x0 + pad
+    inner_y = y0 + 22
+    inner_w = map_w - 2 * pad
+    inner_h = map_h - 32
+
+    roi = frame[y0:y0 + map_h, x0:x0 + map_w]
+    panel = roi.copy()
+    cv2.rectangle(panel, (0, 0), (map_w - 1, map_h - 1), (18, 18, 18), -1)
+    cv2.addWeighted(panel, 0.84, roi, 0.16, 0, roi)
+    cv2.rectangle(frame, (x0, y0), (x0 + map_w - 1, y0 + map_h - 1), HUD_ACCENT, 1, cv2.LINE_AA)
+    cv2.putText(
+        frame, "TAC MAP", (x0 + 6, y0 + 14),
+        cv2.FONT_HERSHEY_SIMPLEX, 0.38, HUD_WARN, 1, cv2.LINE_AA,
+    )
+
+    cv2.rectangle(frame, (inner_x, inner_y), (inner_x + inner_w, inner_y + inner_h), HUD_DIM, 1, cv2.LINE_AA)
+    cx = inner_x + inner_w // 2
+    cy = inner_y + inner_h // 2
+    cv2.drawMarker(frame, (cx, cy), HUD_DIM, cv2.MARKER_CROSS, 6, 1, lineType=cv2.LINE_AA)
+
+    if subject_point is not None:
+        sx, sy = subject_point
+        dot_x = inner_x + int(np.clip(sx / max(frame_w, 1), 0.0, 1.0) * inner_w)
+        dot_y = inner_y + int(np.clip(sy / max(frame_h, 1), 0.0, 1.0) * inner_h)
+
+        dx, dy = dot_x - cx, dot_y - cy
+        angle = float(np.arctan2(dy, dx))
+        cone_half = np.radians(22)
+        radius = min(inner_w, inner_h) // 2 - 2
+        cone_pts = [(cx, cy)]
+        for a in np.linspace(angle - cone_half, angle + cone_half, 14):
+            cone_pts.append((int(cx + radius * np.cos(a)), int(cy + radius * np.sin(a))))
+        cv2.fillPoly(frame, [np.array(cone_pts, dtype=np.int32)], (70, 130, 130))
+        cv2.circle(frame, (dot_x, dot_y), 3, HUD_ACCENT, -1, lineType=cv2.LINE_AA)
+
+    gx, gy = gimbal_xy
+    mag = float(np.hypot(gx, gy))
+    arrow_scale = min(inner_w, inner_h) // 2 - 3
+    if mag >= 0.05:
+        ax = int(cx + gx * arrow_scale)
+        ay = int(cy + gy * arrow_scale)
+        cv2.arrowedLine(
+            frame, (cx, cy), (ax, ay), (140, 140, 255), 1,
+            tipLength=0.35, line_type=cv2.LINE_AA,
+        )
+
+    legend_y = y0 + map_h - 8
+    cv2.circle(frame, (x0 + 8, legend_y - 18), 2, HUD_ACCENT, -1, lineType=cv2.LINE_AA)
+    cv2.putText(frame, "SUB", (x0 + 14, legend_y - 15), cv2.FONT_HERSHEY_SIMPLEX, 0.32, HUD_DIM, 1, cv2.LINE_AA)
+    cv2.line(frame, (x0 + 42, legend_y - 17), (x0 + 54, legend_y - 17), (140, 140, 255), 1, cv2.LINE_AA)
+    cv2.putText(frame, "CAM", (x0 + 58, legend_y - 15), cv2.FONT_HERSHEY_SIMPLEX, 0.32, HUD_DIM, 1, cv2.LINE_AA)
+    cv2.line(frame, (x0 + 84, legend_y - 17), (x0 + 92, legend_y - 19), HUD_ACCENT, 1, cv2.LINE_AA)
+    cv2.line(frame, (x0 + 84, legend_y - 17), (x0 + 92, legend_y - 15), HUD_ACCENT, 1, cv2.LINE_AA)
+    cv2.putText(frame, "CONE", (x0 + 96, legend_y - 15), cv2.FONT_HERSHEY_SIMPLEX, 0.32, HUD_DIM, 1, cv2.LINE_AA)
+
 while cap.isOpened():
     success, frame = cap.read()
     if not success:
         break
     frame = cv2.flip(frame, 1)
+    frame_h, frame_w = frame.shape[:2]
+
+    if startup_scan_active:
+        elapsed = time.perf_counter() - startup_t0
+        phase, phase_progress = get_startup_phase(elapsed)
+        cosmetic_targets = []
+        boot_results = model.track(frame, persist=True, classes=0, conf=0.8, iou=0.5, verbose=False)
+        cosmetic_targets = collect_cosmetic_targets(boot_results, frame_w, frame_h)
+        draw_startup_sequence(frame, phase, phase_progress, cosmetic_targets)
+        cv2.imshow("Person Tracker (Filtered)", frame)
+        if phase == "done":
+            startup_scan_active = False
+            print("TRACKING ONLINE")
+        if cv2.waitKey(1) & 0xFF == ord('q'):
+            break
+        continue
 
     timestamp_ms = int(cap.get(cv2.CAP_PROP_POS_MSEC))
     if timestamp_ms == 0:
@@ -240,11 +631,12 @@ while cap.isOpened():
             full_hand_detected = True
             if is_paused:
                 fist_hold_frames = 0
+                peace_hold_frames = 0
                 if is_open_hand(hand_landmarks):
                     open_hold_frames += 1
-                    if fist_cooldown == 0 and open_hold_frames >= OPEN_HOLD_FRAMES:
+                    if gesture_cooldown == 0 and open_hold_frames >= OPEN_HOLD_FRAMES:
                         is_paused = False
-                        fist_cooldown = 20
+                        gesture_cooldown = 20
                         open_hold_frames = 0
                         print("RESUME")
                 else:
@@ -253,30 +645,45 @@ while cap.isOpened():
                 open_hold_frames = 0
                 if is_fist(hand_landmarks):
                     fist_hold_frames += 1
-                    if fist_cooldown == 0 and fist_hold_frames >= FIST_HOLD_FRAMES:
+                    peace_hold_frames = 0
+                    if gesture_cooldown == 0 and fist_hold_frames >= FIST_HOLD_FRAMES:
                         is_paused = True
-                        fist_cooldown = 20
+                        gimbal_frozen = False
+                        gesture_cooldown = 20
                         fist_hold_frames = 0
                         print("PAUSED")
+                elif is_peace_sign(hand_landmarks):
+                    fist_hold_frames = 0
+                    peace_hold_frames += 1
+                    if gesture_cooldown == 0 and peace_hold_frames >= PEACE_HOLD_FRAMES:
+                        gimbal_frozen = not gimbal_frozen
+                        gimbal_freeze_capture = gimbal_frozen
+                        gesture_cooldown = 20
+                        peace_hold_frames = 0
+                        if gimbal_frozen:
+                            print("GIMBAL FROZEN")
+                        else:
+                            print("GIMBAL UNFROZEN")
                 else:
                     fist_hold_frames = 0
+                    peace_hold_frames = 0
             break
 
     if not full_hand_detected:
         fist_hold_frames = 0
         open_hold_frames = 0
+        peace_hold_frames = 0
 
-    if fist_cooldown > 0:
-        fist_cooldown -= 1
+    if gesture_cooldown > 0:
+        gesture_cooldown -= 1
 
-    state_text = "PAUSED" if is_paused else "PLAYING"
-    text_color = (0, 0, 255) if is_paused else (0, 255, 0)
-    cv2.putText(frame, f"STATUS: {state_text}", (20, 40), 
-                cv2.FONT_HERSHEY_SIMPLEX, 1, text_color, 2)
+    update_fps_counter()
+    update_fake_battery()
 
     coordinate_lines = []
     gimbal_output = (0.0, 0.0)
-    frame_h, frame_w = frame.shape[:2]
+    target_confidence = 0.0
+    subject_lock_point = None
 
     if not is_paused:
         results = model.track(frame, persist=True, classes=0, conf=0.8, iou=0.5, verbose=False) 
@@ -327,6 +734,12 @@ while cap.isOpened():
             subject_track_id = best_subject_id
             if subject_track_id != previous_subject_id:
                 subject_stable_center = None
+            if subject_track_id is not None and subject_track_id in candidate_scores:
+                target_confidence = candidate_scores[subject_track_id][0] * 100.0
+
+            box_confs = None
+            if results[0].boxes.conf is not None:
+                box_confs = results[0].boxes.conf.cpu().numpy()
 
             for idx, (box, track_id) in enumerate(zip(boxes, track_ids)):
                 x, y, w, h = box
@@ -350,7 +763,11 @@ while cap.isOpened():
                     else:
                         display_x, display_y = center_x, center_y
                     subject_stable_center = (display_x, display_y)
+                    subject_lock_point = (display_x, display_y)
                     gimbal_output = compute_gimbal_output((display_x, display_y), frame_w, frame_h)
+                    if box_confs is not None and idx < len(box_confs):
+                        det_conf = float(box_confs[idx]) * 100.0
+                        target_confidence = 0.65 * target_confidence + 0.35 * det_conf
                 else:
                     if torso_point is not None:
                         display_x, display_y = torso_point
@@ -371,16 +788,38 @@ while cap.isOpened():
         subject_stable_center = None
         gimbal_output = (0.0, 0.0)
 
-    move_x, move_y = gimbal_output
-    cv2.putText(frame, f"GIMBAL x:{move_x:+.2f} y:{move_y:+.2f}",
-                (20, 75), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2)
+    if gimbal_frozen and not is_paused:
+        if gimbal_freeze_capture:
+            frozen_gimbal_output = gimbal_output
+            gimbal_freeze_capture = False
+        gimbal_output = frozen_gimbal_output
 
+    move_x, move_y = gimbal_output
+    tracking_mode = get_tracking_mode_label(is_paused, gimbal_frozen, subject_lock_point is not None)
+    draw_cinematic_crosshair(frame)
+    if subject_lock_point is not None and not is_paused:
+        draw_lock_on_reticle(frame, subject_lock_point[0], subject_lock_point[1], locked=True)
+    draw_battery_indicator(frame, fake_battery_pct)
+    draw_hud_panel(
+        frame,
+        tracking_mode=tracking_mode,
+        target_confidence=target_confidence,
+        fps=fps_value,
+        gimbal_xy=(move_x, move_y),
+        gimbal_frozen=gimbal_frozen and not is_paused,
+    )
+    if gimbal_frozen and not is_paused:
+        draw_gimbal_pause_minimap(
+            frame, frame_w, frame_h, subject_lock_point, frozen_gimbal_output,
+        )
+
+    freeze_tag = " FROZEN" if gimbal_frozen and not is_paused else ""
     if is_paused:
         print("TRACKING PAUSED | GIMBAL x:+0.00 y:+0.00")
     elif coordinate_lines:
-        print(" | ".join(coordinate_lines) + f" | GIMBAL x:{move_x:+.2f} y:{move_y:+.2f}")
+        print(" | ".join(coordinate_lines) + f" | GIMBAL x:{move_x:+.2f} y:{move_y:+.2f}{freeze_tag}")
     else:
-        print("No tracked coordinates | GIMBAL x:+0.00 y:+0.00")
+        print(f"No tracked coordinates | GIMBAL x:{move_x:+.2f} y:{move_y:+.2f}{freeze_tag}")
 
     cv2.imshow("Person Tracker (Filtered)", frame)
 
