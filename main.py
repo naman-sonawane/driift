@@ -1,28 +1,13 @@
 import cv2
 import numpy as np
-import mediapipe as mp
+from cvzone.HandTrackingModule import HandDetector
 from ultralytics import YOLO
 import sys
 import time
 
 # Load the YOLO pose model (person boxes + body keypoints)
 model = YOLO('yolov8n-pose.pt')
-
-# Initialize MediaPipe Tasks Hand Landmarker
-BaseOptions = mp.tasks.BaseOptions
-HandLandmarker = mp.tasks.vision.HandLandmarker
-HandLandmarkerOptions = mp.tasks.vision.HandLandmarkerOptions
-VisionRunningMode = mp.tasks.vision.RunningMode
-
-# Configure the landmarker for video stream mode
-options = HandLandmarkerOptions(
-    base_options=BaseOptions(model_asset_path='hand_landmarker.task'),
-    running_mode=VisionRunningMode.VIDEO,
-    num_hands=1,
-    min_hand_detection_confidence=0.7,
-    min_hand_presence_confidence=0.7
-)
-landmarker = HandLandmarker.create_from_options(options)
+hand_detector = HandDetector(detectionCon=0.7, maxHands=1)
 
 def open_camera(preferred_indices=(1, 0, 2, 3)):
     """Try camera indices in order and return the first working capture."""
@@ -38,23 +23,80 @@ def open_camera(preferred_indices=(1, 0, 2, 3)):
 cap = open_camera()
 if cap is None:
     print("ERROR: Could not open any camera device. Try connecting a camera or changing indices.")
-    landmarker.close()
     sys.exit(1)
+
+print("Controls:")
+print("  Fist  -> PAUSE tracking")
+print("  Palm  -> PLAY / resume tracking")
+print("  Peace -> toggle gimbal hold")
+print("  P key -> toggle pause")
+print("  Q key -> quit\n")
+
+DISPLAY_WINDOW = "Person Tracker (Filtered)"
+_display_window_ready = False
+
+def _get_window_client_size(fallback_w, fallback_h):
+    """Actual window client area (OpenCV getWindowImageRect can report image size, not window)."""
+    if sys.platform == "win32":
+        try:
+            import ctypes
+            from ctypes import wintypes
+
+            hwnd = ctypes.windll.user32.FindWindowW(None, DISPLAY_WINDOW)
+            if hwnd:
+                rect = wintypes.RECT()
+                if ctypes.windll.user32.GetClientRect(hwnd, ctypes.byref(rect)):
+                    w = rect.right - rect.left
+                    h = rect.bottom - rect.top
+                    if w > 0 and h > 0:
+                        return w, h
+        except Exception:
+            pass
+
+    try:
+        _, _, w, h = cv2.getWindowImageRect(DISPLAY_WINDOW)
+        if w > 0 and h > 0:
+            return w, h
+    except cv2.error:
+        pass
+    return fallback_w, fallback_h
+
+def show_frame(frame):
+    """Letterbox frame into the window so aspect ratio is never stretched."""
+    global _display_window_ready
+    if not _display_window_ready:
+        cv2.namedWindow(DISPLAY_WINDOW, cv2.WINDOW_NORMAL)
+        cv2.resizeWindow(DISPLAY_WINDOW, frame.shape[1], frame.shape[0])
+        _display_window_ready = True
+
+    fh, fw = frame.shape[:2]
+    win_w, win_h = _get_window_client_size(fw, fh)
+
+    scale = min(win_w / fw, win_h / fh)
+    new_w = max(1, int(fw * scale))
+    new_h = max(1, int(fh * scale))
+    scaled = cv2.resize(frame, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
+
+    if new_w == win_w and new_h == win_h:
+        display = scaled
+    else:
+        display = np.zeros((win_h, win_w, 3), dtype=np.uint8)
+        x0 = (win_w - new_w) // 2
+        y0 = (win_h - new_h) // 2
+        display[y0 : y0 + new_h, x0 : x0 + new_w] = scaled
+
+    cv2.imshow(DISPLAY_WINDOW, display)
 
 # State variables for the tracking toggle
 is_paused = False
 gimbal_frozen = False
 frozen_gimbal_output = (0.0, 0.0)
 gimbal_freeze_capture = False  # Latch current gimbal output on next frame after peace sign.
-gesture_cooldown = 0  # Prevents rapid flickering between gestures
-fist_hold_frames = 0  # Requires a stable fist for multiple frames
-open_hold_frames = 0  # Requires a stable open hand for resume
-peace_hold_frames = 0  # Requires a stable peace sign to freeze/unfreeze gimbal
 
-FULL_HAND_MIN_SPAN = 0.25
-FIST_HOLD_FRAMES = 4
-OPEN_HOLD_FRAMES = 3
-PEACE_HOLD_FRAMES = 4
+# Gesture debounce: must be stable for N consecutive frames before triggering
+GESTURE_HOLD = 8
+gesture_buffer = []
+last_triggered_gesture = None
 LOOKING_SCORE_THRESHOLD = 0.45
 SUBJECT_DEADBAND_PX = 12   # Ignore tiny jitter under this pixel distance.
 SUBJECT_SMOOTHING_ALPHA = 0.25  # Lower value = smoother, less responsive.
@@ -82,70 +124,71 @@ STARTUP_IDENTIFY_DURATION = 1.35
 startup_scan_active = True
 startup_t0 = time.perf_counter()
 
-def is_fist(hand_landmarks):
-    """Detects a fist by checking if fingers are curled into the palm."""
-    tips = [8, 12, 16, 20]
-    pip_joints = [6, 10, 14, 18]
-    
-    folded_fingers = 0
-    for tip, pip in zip(tips, pip_joints):
-        if hand_landmarks[tip].y > hand_landmarks[pip].y:
-            folded_fingers += 1
-            
-    return folded_fingers == 4
+def classify_cvzone_gesture(fingers):
+    """Map cvzone fingersUp list to fist / palm / peace, or None."""
+    if not fingers or len(fingers) < 5:
+        return None
+    count = sum(fingers[1:])
+    if count == 0:
+        return 'fist'
+    if count == 4 and fingers[0] == 1:
+        return 'palm'
+    if fingers[1] and fingers[2] and not fingers[3] and not fingers[4]:
+        return 'peace'
+    return None
 
-def is_open_hand(hand_landmarks):
-    """Detects an open hand by checking if fingers are extended."""
-    tips = [8, 12, 16, 20]
-    pip_joints = [6, 10, 14, 18]
+def detect_hand_gesture(frame):
+    """Returns current gesture label from cvzone, or None."""
+    hands, _ = hand_detector.findHands(frame, draw=True)
+    if not hands:
+        return None
+    return classify_cvzone_gesture(hand_detector.fingersUp(hands[0]))
 
-    extended_fingers = 0
-    for tip, pip in zip(tips, pip_joints):
-        if hand_landmarks[tip].y < hand_landmarks[pip].y:
-            extended_fingers += 1
+def update_gesture_controls(detected_gesture):
+    """Debounced fist/palm pause-resume and peace gimbal freeze."""
+    global is_paused, gimbal_frozen, gimbal_freeze_capture
+    global gesture_buffer, last_triggered_gesture
 
-    return extended_fingers >= 4
+    gesture_buffer.append(detected_gesture)
+    if len(gesture_buffer) > GESTURE_HOLD:
+        gesture_buffer.pop(0)
 
-def is_finger_extended(hand_landmarks, tip_idx, pip_idx):
-    return hand_landmarks[tip_idx].y < hand_landmarks[pip_idx].y
+    if len(gesture_buffer) == GESTURE_HOLD and len(set(gesture_buffer)) == 1:
+        stable = gesture_buffer[0]
+        if stable and stable != last_triggered_gesture:
+            if stable == 'fist' and not is_paused:
+                is_paused = True
+                gimbal_frozen = False
+                print("Fist -> PAUSED")
+            elif stable == 'palm' and is_paused:
+                is_paused = False
+                print("Palm -> PLAYING")
+            elif stable == 'peace' and not is_paused:
+                gimbal_frozen = not gimbal_frozen
+                gimbal_freeze_capture = gimbal_frozen
+                if gimbal_frozen:
+                    print("GIMBAL FROZEN")
+                else:
+                    print("GIMBAL UNFROZEN")
+            last_triggered_gesture = stable
+    elif detected_gesture is None:
+        last_triggered_gesture = None
 
-def is_finger_folded(hand_landmarks, tip_idx, pip_idx):
-    return hand_landmarks[tip_idx].y > hand_landmarks[pip_idx].y
-
-def is_peace_sign(hand_landmarks):
-    """Two fingers up (index + middle), ring and pinky down."""
-    if is_fist(hand_landmarks) or is_open_hand(hand_landmarks):
-        return False
-
-    index_up = is_finger_extended(hand_landmarks, 8, 6)
-    middle_up = is_finger_extended(hand_landmarks, 12, 10)
-    ring_down = is_finger_folded(hand_landmarks, 16, 14)
-    pinky_down = is_finger_folded(hand_landmarks, 20, 18)
-    if not (index_up and middle_up and ring_down and pinky_down):
-        return False
-
-    # Fingertips should be above the folded fingers (peace sign pointing up).
-    index_tip = hand_landmarks[8]
-    middle_tip = hand_landmarks[12]
-    ring_tip = hand_landmarks[16]
-    return index_tip.y < ring_tip.y and middle_tip.y < ring_tip.y
-
-def is_full_hand_visible(hand_landmarks):
-    """Checks that the hand is fully in frame and large enough to be reliable."""
-    xs = [lm.x for lm in hand_landmarks]
-    ys = [lm.y for lm in hand_landmarks]
-
-    # All landmarks should be within view with a tiny edge margin.
-    margin = 0.03
-    if min(xs) < margin or max(xs) > 1 - margin:
-        return False
-    if min(ys) < margin or max(ys) > 1 - margin:
-        return False
-
-    # Hand should occupy enough image area to avoid tiny false positives.
-    hand_width = max(xs) - min(xs)
-    hand_height = max(ys) - min(ys)
-    return max(hand_width, hand_height) >= FULL_HAND_MIN_SPAN
+def draw_gesture_hint(frame, detected_gesture):
+    """Bottom-left gesture label (local-style feedback on remote HUD)."""
+    if not detected_gesture:
+        return
+    h = frame.shape[0]
+    labels = {
+        'fist': ("Gesture: FIST", (0, 0, 255)),
+        'palm': ("Gesture: PALM", (0, 255, 0)),
+        'peace': ("Gesture: PEACE", HUD_WARN),
+    }
+    text, color = labels[detected_gesture]
+    cv2.putText(
+        frame, text, (20, h - 20),
+        cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2, cv2.LINE_AA,
+    )
 
 def get_facing_camera_score(keypoints):
     """
@@ -605,7 +648,7 @@ while cap.isOpened():
         boot_results = model.track(frame, persist=True, classes=0, conf=0.8, iou=0.5, verbose=False)
         cosmetic_targets = collect_cosmetic_targets(boot_results, frame_w, frame_h)
         draw_startup_sequence(frame, phase, phase_progress, cosmetic_targets)
-        cv2.imshow("Person Tracker (Filtered)", frame)
+        show_frame(frame)
         if phase == "done":
             startup_scan_active = False
             print("TRACKING ONLINE")
@@ -613,69 +656,8 @@ while cap.isOpened():
             break
         continue
 
-    timestamp_ms = int(cap.get(cv2.CAP_PROP_POS_MSEC))
-    if timestamp_ms == 0:
-        timestamp_ms = int(cv2.getTickCount() / cv2.getTickFrequency() * 1000)
-
-    rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-    mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb_frame)
-    
-    hand_results = landmarker.detect_for_video(mp_image, timestamp_ms)
-
-    full_hand_detected = False
-    if hand_results.hand_landmarks:
-        for hand_landmarks in hand_results.hand_landmarks:
-            if not is_full_hand_visible(hand_landmarks):
-                continue
-
-            full_hand_detected = True
-            if is_paused:
-                fist_hold_frames = 0
-                peace_hold_frames = 0
-                if is_open_hand(hand_landmarks):
-                    open_hold_frames += 1
-                    if gesture_cooldown == 0 and open_hold_frames >= OPEN_HOLD_FRAMES:
-                        is_paused = False
-                        gesture_cooldown = 20
-                        open_hold_frames = 0
-                        print("RESUME")
-                else:
-                    open_hold_frames = 0
-            else:
-                open_hold_frames = 0
-                if is_fist(hand_landmarks):
-                    fist_hold_frames += 1
-                    peace_hold_frames = 0
-                    if gesture_cooldown == 0 and fist_hold_frames >= FIST_HOLD_FRAMES:
-                        is_paused = True
-                        gimbal_frozen = False
-                        gesture_cooldown = 20
-                        fist_hold_frames = 0
-                        print("PAUSED")
-                elif is_peace_sign(hand_landmarks):
-                    fist_hold_frames = 0
-                    peace_hold_frames += 1
-                    if gesture_cooldown == 0 and peace_hold_frames >= PEACE_HOLD_FRAMES:
-                        gimbal_frozen = not gimbal_frozen
-                        gimbal_freeze_capture = gimbal_frozen
-                        gesture_cooldown = 20
-                        peace_hold_frames = 0
-                        if gimbal_frozen:
-                            print("GIMBAL FROZEN")
-                        else:
-                            print("GIMBAL UNFROZEN")
-                else:
-                    fist_hold_frames = 0
-                    peace_hold_frames = 0
-            break
-
-    if not full_hand_detected:
-        fist_hold_frames = 0
-        open_hold_frames = 0
-        peace_hold_frames = 0
-
-    if gesture_cooldown > 0:
-        gesture_cooldown -= 1
+    detected_gesture = detect_hand_gesture(frame)
+    update_gesture_controls(detected_gesture)
 
     update_fps_counter()
     update_fake_battery()
@@ -796,6 +778,7 @@ while cap.isOpened():
 
     move_x, move_y = gimbal_output
     tracking_mode = get_tracking_mode_label(is_paused, gimbal_frozen, subject_lock_point is not None)
+    draw_gesture_hint(frame, detected_gesture)
     draw_cinematic_crosshair(frame)
     if subject_lock_point is not None and not is_paused:
         draw_lock_on_reticle(frame, subject_lock_point[0], subject_lock_point[1], locked=True)
@@ -821,11 +804,16 @@ while cap.isOpened():
     else:
         print(f"No tracked coordinates | GIMBAL x:{move_x:+.2f} y:{move_y:+.2f}{freeze_tag}")
 
-    cv2.imshow("Person Tracker (Filtered)", frame)
+    show_frame(frame)
 
-    if cv2.waitKey(1) & 0xFF == ord('q'):
+    key = cv2.waitKey(1) & 0xFF
+    if key == ord('q'):
         break
+    if key == ord('p'):
+        is_paused = not is_paused
+        if is_paused:
+            gimbal_frozen = False
+        print("PAUSED" if is_paused else "RESUME")
 
 cap.release()
-landmarker.close()
 cv2.destroyAllWindows()
