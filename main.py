@@ -4,10 +4,130 @@ from cvzone.HandTrackingModule import HandDetector
 from ultralytics import YOLO
 import sys
 import time
+import serial
+import serial.tools.list_ports
 
 # Load the YOLO pose model (person boxes + body keypoints)
 model = YOLO('yolov8n-pose.pt')
 hand_detector = HandDetector(detectionCon=0.7, maxHands=1)
+
+# ── Arduino serial (9600 baud — matches main/main.ino) ───────────────────────
+arduino = None
+connection_lost = False
+last_heartbeat = 0.0
+ARDUINO_BAUD = 9600
+HEARTBEAT_INTERVAL = 5.0
+
+
+def find_arduino_port():
+    """Return the first port that looks like an Arduino."""
+    for port in serial.tools.list_ports.comports():
+        desc = port.description or ""
+        if any(tag in desc for tag in ("Arduino", "CH340", "USB Serial")):
+            return port.device
+    return None
+
+
+def connect_to_arduino():
+    global arduino, connection_lost, last_heartbeat
+    arduino_port = find_arduino_port() or "COM3"
+    try:
+        print(f"Connecting to Arduino on {arduino_port}...")
+        arduino = serial.Serial(arduino_port, ARDUINO_BAUD, timeout=1)
+        time.sleep(2)  # Wait for Arduino reset after USB open
+        deadline = time.time() + 8.0
+        while time.time() < deadline:
+            if arduino.in_waiting:
+                msg = arduino.readline().decode(errors="replace").strip()
+                if msg:
+                    print(f"Arduino: {msg}")
+                if msg == "DRIIFT_READY":
+                    connection_lost = False
+                    last_heartbeat = time.time()
+                    print("Arduino connected — DRIIFT hardware online.")
+                    return True
+            time.sleep(0.05)
+        print("Warning: Arduino did not send DRIIFT_READY; continuing anyway.")
+        connection_lost = False
+        last_heartbeat = time.time()
+        return True
+    except Exception as exc:
+        print(f"Failed to connect to Arduino: {exc}")
+        arduino = None
+        return False
+
+
+def drain_arduino_inbox():
+    """Print any pending lines from the Arduino (non-blocking)."""
+    if arduino is None or not arduino.is_open:
+        return
+    try:
+        while arduino.in_waiting:
+            msg = arduino.readline().decode(errors="replace").strip()
+            if msg:
+                print(f"Arduino: {msg}")
+    except Exception as exc:
+        print(f"Serial read error: {exc}")
+
+
+def check_arduino_connection():
+    global last_heartbeat
+    if arduino is None or not arduino.is_open:
+        return False
+    try:
+        if time.time() - last_heartbeat > HEARTBEAT_INTERVAL:
+            arduino.write(b"PING\n")
+            last_heartbeat = time.time()
+        return True
+    except Exception:
+        return False
+
+
+def handle_connection_loss():
+    global connection_lost
+    if not connection_lost:
+        connection_lost = True
+        print("Arduino disconnected — servos will hold last position.")
+
+
+def reconnect_arduino():
+    global arduino
+    print("Attempting to reconnect to Arduino...")
+    if arduino is not None:
+        try:
+            arduino.close()
+        except Exception:
+            pass
+        arduino = None
+    return connect_to_arduino()
+
+
+def send_arduino_command(command):
+    """Send a newline-terminated command to the Arduino."""
+    global last_heartbeat
+    if arduino is None or connection_lost:
+        return False
+    try:
+        arduino.write(f"{command}\n".encode())
+        last_heartbeat = time.time()
+        return True
+    except Exception as exc:
+        print(f"Serial write error: {exc}")
+        handle_connection_loss()
+        return False
+
+
+def send_tracking_to_arduino(subject_point, frame_w, frame_h, active):
+    """
+    Push pixel offsets or LOST to the Arduino.
+    Protocol (main.ino): "offsetX,offsetY" | LOST | RESET | PING
+    """
+    if not active or subject_point is None:
+        send_arduino_command("LOST")
+        return
+    off_x = int(subject_point[0] - frame_w // 2)
+    off_y = int(subject_point[1] - frame_h // 2)
+    send_arduino_command(f"{off_x},{off_y}")
 
 def open_camera(preferred_indices=(1, 0, 2, 3)):
     """Try camera indices in order and return the first working capture."""
@@ -25,11 +145,16 @@ if cap is None:
     print("ERROR: Could not open any camera device. Try connecting a camera or changing indices.")
     sys.exit(1)
 
+if not connect_to_arduino():
+    print("ERROR: Could not connect to Arduino. Check USB cable and upload main/main.ino.")
+    sys.exit(1)
+
 print("Controls:")
 print("  Fist  -> PAUSE tracking")
 print("  Palm  -> PLAY / resume tracking")
 print("  Peace -> toggle gimbal hold")
 print("  P key -> toggle pause")
+print("  R key -> re-center servos (RESET)")
 print("  Q key -> quit\n")
 
 DISPLAY_WINDOW = "Person Tracker (Filtered)"
@@ -641,6 +766,14 @@ while cap.isOpened():
     frame = cv2.flip(frame, 1)
     frame_h, frame_w = frame.shape[:2]
 
+    if not check_arduino_connection():
+        handle_connection_loss()
+        if reconnect_arduino():
+            connection_lost = False
+            print("Arduino reconnected.")
+    else:
+        drain_arduino_inbox()
+
     if startup_scan_active:
         elapsed = time.perf_counter() - startup_t0
         phase, phase_progress = get_startup_phase(elapsed)
@@ -648,6 +781,7 @@ while cap.isOpened():
         boot_results = model.track(frame, persist=True, classes=0, conf=0.8, iou=0.5, verbose=False)
         cosmetic_targets = collect_cosmetic_targets(boot_results, frame_w, frame_h)
         draw_startup_sequence(frame, phase, phase_progress, cosmetic_targets)
+        send_tracking_to_arduino(None, frame_w, frame_h, active=False)
         show_frame(frame)
         if phase == "done":
             startup_scan_active = False
@@ -804,6 +938,13 @@ while cap.isOpened():
     else:
         print(f"No tracked coordinates | GIMBAL x:{move_x:+.2f} y:{move_y:+.2f}{freeze_tag}")
 
+    tracking_active = (
+        not is_paused
+        and not gimbal_frozen
+        and subject_lock_point is not None
+    )
+    send_tracking_to_arduino(subject_lock_point, frame_w, frame_h, tracking_active)
+
     show_frame(frame)
 
     key = cv2.waitKey(1) & 0xFF
@@ -814,6 +955,15 @@ while cap.isOpened():
         if is_paused:
             gimbal_frozen = False
         print("PAUSED" if is_paused else "RESUME")
+    if key == ord('r'):
+        send_arduino_command("RESET")
+        print("Sent RESET — servos re-centering.")
+
+if arduino is not None:
+    try:
+        arduino.close()
+    except Exception:
+        pass
 
 cap.release()
 cv2.destroyAllWindows()
