@@ -1,17 +1,13 @@
 // ============================================================
 // DRIIFT - Auto-Tracking Camera Mount
-// Arduino Uno/Mega main.cpp
-// Revised for continuous-rotation servos
+// Arduino Uno/Mega
+// Protocol: LEFT | RIGHT | SAFE | RESET | PING
 // ============================================================
 
 #include <LiquidCrystal.h>
 #include <Servo.h>
 
-// ── LCD ──────────────────────────────────────────────────────
-
 LiquidCrystal lcd(12, 11, 5, 4, 3, 2);
-
-// ── Continuous-rotation servos ──────────────────────────────
 
 Servo servoX;
 Servo servoY;
@@ -19,52 +15,42 @@ Servo servoY;
 const int SERVO_X_PIN = 9;
 const int SERVO_Y_PIN = 10;
 
-// ── LEDs ─────────────────────────────────────────────────────
-
 const int LED_GREEN = A1;
 const int LED_RED   = A2;
 
-// ── Servo Configuration ─────────────────────────────────────
-//
-// Continuous rotation servos:
-// 90 = stop
-// <90 = one direction
-// >90 = other direction
-//
-// If servos creep while idle, adjust these values.
-// Common values are 92.
-
+// Continuous rotation: 90 = stop, <90 / >90 = spin directions.
 const int SERVO_X_STOP = 92;
 const int SERVO_Y_STOP = 92;
 
-// Maximum offset (pixels) that maps to full speed.
-const int FULL_OFFSET_PX = 120;
+const int MOVE_SPEED = 3;        // PWM offset when pulsing (tune this: 2–5)
+const unsigned long PULSE_DURATION_MS = 40;   // how long each pulse fires (tune this: 40–120ms)
+const unsigned long PULSE_COOLDOWN_MS = 90;  // mandatory stop gap between pulses
 
-// Ignore tiny movements near center.
-const int DEAD_ZONE = 12;
+unsigned long pulseStartTime = 0;
+bool inPulse = false;
 
-// Reverse direction if required.
-const bool INVERT_X = true;
-const bool INVERT_Y = true;
+// Trim if one direction is weaker than the other.
+const int SERVO_X_LEFT_TRIM = 4;
+const int SERVO_X_RIGHT_TRIM = 0;
 
-// ── Timeout ──────────────────────────────────────────────────
+
+const bool INVERT_X = false;
+const bool INVERT_Y = false;
 
 const unsigned long TIMEOUT_MS = 1500;
 
-// ── State ────────────────────────────────────────────────────
+enum Command { CMD_SAFE, CMD_LEFT, CMD_RIGHT };
 
 int pwmX = SERVO_X_STOP;
 int pwmY = SERVO_Y_STOP;
+int targetPwmX = SERVO_X_STOP;
+int targetPwmY = SERVO_Y_STOP;
 
-bool tracking = false;
-
+Command activeCmd = CMD_SAFE;
 unsigned long lastMsg = 0;
 
-// LCD refresh throttle
 unsigned long lastLCDUpdate = 0;
 const unsigned long LCD_INTERVAL = 200;
-
-// ── Helpers ──────────────────────────────────────────────────
 
 void setLED(bool green, bool red)
 {
@@ -72,112 +58,129 @@ void setLED(bool green, bool red)
     digitalWrite(LED_RED, red ? HIGH : LOW);
 }
 
-int offsetToPwm(int offset, int stopVal, bool invert)
+int pwmForCommand(Command cmd)
 {
-    if (invert)
+    if (cmd == CMD_SAFE)
     {
-        offset = -offset;
+        return SERVO_X_STOP;
     }
 
-    if (abs(offset) < DEAD_ZONE)
+    int stop = SERVO_X_STOP;
+    int speed = MOVE_SPEED;
+
+    if (cmd == CMD_LEFT)
     {
-        return stopVal;
+        stop -= SERVO_X_LEFT_TRIM;
+        speed = -MOVE_SPEED;
+    }
+    else
+    {
+        stop += SERVO_X_RIGHT_TRIM;
+        speed = MOVE_SPEED;
     }
 
-    int speed = map(
-        constrain(abs(offset), 0, FULL_OFFSET_PX),
-        0,
-        FULL_OFFSET_PX,
-        15,
-        85
-    );
-
-    if (offset < 0)
+    if (INVERT_X)
     {
         speed = -speed;
     }
 
-    return constrain(stopVal + speed, 0, 180);
+    return constrain(stop + speed, 0, 180);
 }
 
-void stopMotors()
+void stopMotors(bool immediate = false)
 {
-    pwmX = SERVO_X_STOP;
-    pwmY = SERVO_Y_STOP;
+    activeCmd = CMD_SAFE;
+    targetPwmX = SERVO_X_STOP;
+    targetPwmY = SERVO_Y_STOP;
 
-    servoX.write(SERVO_X_STOP);
-    servoY.write(SERVO_Y_STOP);
+    if (immediate)
+    {
+        pwmX = SERVO_X_STOP;
+        pwmY = SERVO_Y_STOP;
+        servoX.write(SERVO_X_STOP);
+        servoY.write(SERVO_Y_STOP);
+    }
 }
 
-// ── Setup ────────────────────────────────────────────────────
+void applyCommand(Command cmd)
+{
+    activeCmd = cmd;
+    lastMsg = millis();
+
+    // Only start a new pulse if we're not mid-cooldown
+    if (!inPulse) {
+        pulseStartTime = millis();
+        inPulse = true;
+        targetPwmX = pwmForCommand(cmd);
+    }
+    targetPwmY = SERVO_Y_STOP;
+}
+
+const char* commandLabel(Command cmd)
+{
+    switch (cmd)
+    {
+        case CMD_LEFT:  return "LEFT ";
+        case CMD_RIGHT: return "RIGHT";
+        default:        return "SAFE ";
+    }
+}
 
 void setup()
 {
-    Serial.begin(9600);
+    Serial.begin(115200);
 
-    // IMPORTANT:
-    // Use standard attach() since your test code works this way.
     servoX.attach(SERVO_X_PIN);
     servoY.attach(SERVO_Y_PIN);
+    stopMotors(true);
 
-    stopMotors();
-
-    // LEDs
     pinMode(LED_GREEN, OUTPUT);
     pinMode(LED_RED, OUTPUT);
-
     setLED(false, true);
 
-    // LCD
     lcd.begin(16, 2);
     lcd.clear();
-
     lcd.setCursor(0, 0);
     lcd.print(" DRIIFT v1.0 ");
-
     lcd.setCursor(0, 1);
     lcd.print(" Waiting... ");
-
     delay(1500);
 
     lcd.clear();
-
     lcd.setCursor(0, 0);
     lcd.print("Status: IDLE ");
-
     lcd.setCursor(0, 1);
-    lcd.print("No subject     ");
+    lcd.print("Cmd: SAFE       ");
 
     lastMsg = millis();
-
     Serial.println("DRIIFT_READY");
 }
 
-// ── Main Loop ────────────────────────────────────────────────
-
 void loop()
 {
-    // --------------------------------------------------------
-    // Read serial commands
-    // --------------------------------------------------------
-
     if (Serial.available())
     {
         String raw = Serial.readStringUntil('\n');
         raw.trim();
 
-        if (raw == "LOST")
+        if (raw == "SAFE" || raw == "LOST")
         {
-            tracking = false;
-            lastMsg = millis();
+            stopMotors(true);
+            inPulse = false;
+        }
+        else if (raw == "LEFT")
+        {
+            applyCommand(CMD_LEFT);
+        }
+        else if (raw == "RIGHT")
+        {
+            applyCommand(CMD_RIGHT);
         }
         else if (raw == "RESET")
         {
-            stopMotors();
-
-            tracking = false;
+            stopMotors(true);
+            inPulse = false;
             lastMsg = millis();
-
             Serial.println("ACK_RESET");
         }
         else if (raw == "PING")
@@ -185,102 +188,49 @@ void loop()
             Serial.println("PONG");
             lastMsg = millis();
         }
-        else
-        {
-            int commaIdx = raw.indexOf(',');
-
-            if (commaIdx > 0)
-            {
-                int offX = raw.substring(0, commaIdx).toInt();
-                int offY = raw.substring(commaIdx + 1).toInt();
-
-                pwmX = offsetToPwm(
-                    offX,
-                    SERVO_X_STOP,
-                    INVERT_X
-                );
-
-                pwmY = offsetToPwm(
-                    offY,
-                    SERVO_Y_STOP,
-                    INVERT_Y
-                );
-
-                servoX.write(pwmX);
-                servoY.write(pwmY);
-
-                tracking = true;
-                lastMsg = millis();
-
-                // Debug output
-                Serial.print("X:");
-                Serial.print(offX);
-
-                Serial.print(" PWMX:");
-                Serial.print(pwmX);
-
-                Serial.print(" Y:");
-                Serial.print(offY);
-
-                Serial.print(" PWMY:");
-                Serial.println(pwmY);
-            }
-        }
     }
-
-    // --------------------------------------------------------
-    // Timeout detection
-    // --------------------------------------------------------
 
     unsigned long now = millis();
 
+    // Watchdog: no command received recently
     if (now - lastMsg > TIMEOUT_MS)
     {
-        tracking = false;
+        stopMotors(true);
+        inPulse = false;
     }
 
-    // --------------------------------------------------------
-    // Stop motors when tracking lost
-    // --------------------------------------------------------
-
-    if (!tracking)
+    // Pulse-and-stop logic
+    if (inPulse)
     {
-        stopMotors();
+        if (now - pulseStartTime >= PULSE_DURATION_MS)
+        {
+            inPulse = false;
+            pwmX = SERVO_X_STOP;
+            pwmY = SERVO_Y_STOP;
+            servoX.write(SERVO_X_STOP);
+            servoY.write(SERVO_Y_STOP);
+        }
+        else
+        {
+            servoX.write(targetPwmX);
+            servoY.write(targetPwmY);
+        }
     }
 
-    // --------------------------------------------------------
-    // LEDs
-    // --------------------------------------------------------
-
-    setLED(tracking, !tracking);
-
-    // --------------------------------------------------------
-    // LCD Updates
-    // --------------------------------------------------------
+    setLED(activeCmd != CMD_SAFE, activeCmd == CMD_SAFE);
 
     if (now - lastLCDUpdate >= LCD_INTERVAL)
     {
         lastLCDUpdate = now;
 
         lcd.setCursor(0, 0);
-
-        if (tracking)
-        {
-            lcd.print("Status: TRACKING");
-        }
-        else
-        {
-            lcd.print("Status: IDLE    ");
-        }
+        lcd.print(activeCmd == CMD_SAFE ? "Status: IDLE    " : "Status: TRACKING");
 
         lcd.setCursor(0, 1);
-
-        lcd.print("X:");
+        lcd.print("Cmd:");
+        lcd.print(commandLabel(activeCmd));
+        lcd.print(" X:");
         lcd.print(pwmX);
-
-        lcd.print(" Y:");
-        lcd.print(pwmY);
-
         lcd.print("   ");
     }
 

@@ -11,11 +11,11 @@ import serial.tools.list_ports
 model = YOLO('yolov8n-pose.pt')
 hand_detector = HandDetector(detectionCon=0.7, maxHands=1)
 
-# ── Arduino serial (9600 baud — matches main/main.ino) ───────────────────────
+# ── Arduino serial (115200 baud — matches main/main.ino) ─────────────────────
 arduino = None
 connection_lost = False
 last_heartbeat = 0.0
-ARDUINO_BAUD = 9600
+ARDUINO_BAUD = 115200
 HEARTBEAT_INTERVAL = 5.0
 
 
@@ -117,17 +117,24 @@ def send_arduino_command(command):
         return False
 
 
-def send_tracking_to_arduino(subject_point, frame_w, frame_h, active):
+
+def direction_for_arduino(subject_point, frame_w, active):
     """
-    Push pixel offsets or LOST to the Arduino.
-    Protocol (main.ino): "offsetX,offsetY" | LOST | RESET | PING
+    Map subject position to a simple mount command for the Arduino.
+    Returns LEFT | RIGHT | SAFE (deadzone / inactive).
     """
     if not active or subject_point is None:
-        send_arduino_command("LOST")
-        return
-    off_x = int(subject_point[0] - frame_w // 2)
-    off_y = int(subject_point[1] - frame_h // 2)
-    send_arduino_command(f"{off_x},{off_y}")
+        return "SAFE"
+
+    off_x = subject_point[0] - frame_w // 2
+    if abs(off_x) <= TRACK_DEADZONE_PX:
+        return "SAFE"
+    return "RIGHT" if off_x > 0 else "LEFT"
+
+
+def send_tracking_to_arduino(subject_point, frame_w, frame_h, active):
+    """Push LEFT | RIGHT | SAFE to the Arduino every frame (main.ino)."""
+    send_arduino_command(direction_for_arduino(subject_point, frame_w, active))
 
 def open_camera(preferred_indices=(1, 0, 2, 3)):
     """Try camera indices in order and return the first working capture."""
@@ -223,9 +230,10 @@ GESTURE_HOLD = 8
 gesture_buffer = []
 last_triggered_gesture = None
 LOOKING_SCORE_THRESHOLD = 0.45
-SUBJECT_DEADBAND_PX = 12   # Ignore tiny jitter under this pixel distance.
+SUBJECT_DEADBAND_PX = 25   # Ignore tiny jitter under this pixel distance.
 SUBJECT_SMOOTHING_ALPHA = 0.25  # Lower value = smoother, less responsive.
 SUBJECT_REACQUIRE_PX = 80   # Snap quickly if target jumps a large distance.
+TRACK_DEADZONE_PX = 40  # Subject within this many pixels of center -> SAFE
 GIMBAL_DEADBAND_RATIO = 0.03  # Ignore tiny center errors (<3% of frame half-size).
 GIMBAL_GAIN_X = 0.8
 GIMBAL_GAIN_Y = 0.8
