@@ -32,19 +32,19 @@ const int LED_RED   = A2;
 // >90 = other direction
 //
 // If servos creep while idle, adjust these values.
-// Common values are 88–92.
+// Common values are 92.
 
 const int SERVO_X_STOP = 92;
-const int SERVO_Y_STOP = 90;
+const int SERVO_Y_STOP = 92;
 
 // Maximum offset (pixels) that maps to full speed.
 const int FULL_OFFSET_PX = 120;
 
 // Ignore tiny movements near center.
-const int DEAD_ZONE = 8;
+const int DEAD_ZONE = 12;
 
 // Reverse direction if required.
-const bool INVERT_X = false;
+const bool INVERT_X = true;
 const bool INVERT_Y = true;
 
 // ── Timeout ──────────────────────────────────────────────────
