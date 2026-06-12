@@ -118,23 +118,28 @@ def send_arduino_command(command):
 
 
 
-def direction_for_arduino(subject_point, frame_w, active):
+def direction_for_arduino_axis(subject_point, frame_size, axis_index, active):
     """
-    Map subject position to a simple mount command for the Arduino.
-    Returns LEFT | RIGHT | SAFE (deadzone / inactive).
+    Map subject position on one axis to a mount command for the Arduino.
+    X: LEFT | RIGHT | SAFE.  Y: UP | DOWN | SAFE.
     """
     if not active or subject_point is None:
         return "SAFE"
 
-    off_x = subject_point[0] - frame_w // 2
-    if abs(off_x) <= TRACK_DEADZONE_PX:
+    off = subject_point[axis_index] - frame_size // 2
+    if abs(off) <= TRACK_DEADZONE_PX:
         return "SAFE"
-    return "RIGHT" if off_x > 0 else "LEFT"
+    if axis_index == 0:
+        return "RIGHT" if off > 0 else "LEFT"
+    return "DOWN" if off > 0 else "UP"
 
 
 def send_tracking_to_arduino(subject_point, frame_w, frame_h, active):
-    """Push LEFT | RIGHT | SAFE to the Arduino every frame (main.ino)."""
-    send_arduino_command(direction_for_arduino(subject_point, frame_w, active))
+    """Push X: and Y: axis commands to the Arduino every frame (main.ino)."""
+    x_cmd = direction_for_arduino_axis(subject_point, frame_w, 0, active)
+    y_cmd = direction_for_arduino_axis(subject_point, frame_h, 1, active)
+    send_arduino_command(f"X:{x_cmd}")
+    send_arduino_command(f"Y:{y_cmd}")
 
 def open_camera(preferred_indices=(1, 0, 2, 3)):
     """Try camera indices in order and return the first working capture."""
@@ -157,7 +162,7 @@ if not connect_to_arduino():
     sys.exit(1)
 
 print("Controls:")
-print("  Fist  -> PAUSE tracking")
+print("  Thumbs Up  -> PAUSE tracking")
 print("  Palm  -> PLAY / resume tracking")
 print("  Peace -> toggle gimbal hold")
 print("  P key -> toggle pause")
@@ -258,12 +263,12 @@ startup_scan_active = True
 startup_t0 = time.perf_counter()
 
 def classify_cvzone_gesture(fingers):
-    """Map cvzone fingersUp list to fist / palm / peace, or None."""
+    """Map cvzone fingersUp list to thumbs up / palm / peace, or None."""
     if not fingers or len(fingers) < 5:
         return None
     count = sum(fingers[1:])
-    if count == 0:
-        return 'fist'
+    if fingers[0] and count == 0:
+        return 'thumbs_up'
     if count == 4 and fingers[0] == 1:
         return 'palm'
     if fingers[1] and fingers[2] and not fingers[3] and not fingers[4]:
@@ -278,7 +283,7 @@ def detect_hand_gesture(frame):
     return classify_cvzone_gesture(hand_detector.fingersUp(hands[0]))
 
 def update_gesture_controls(detected_gesture):
-    """Debounced fist/palm pause-resume and peace gimbal freeze."""
+    """Debounced thumbs up/palm pause-resume and peace gimbal freeze."""
     global is_paused, gimbal_frozen, gimbal_freeze_capture
     global gesture_buffer, last_triggered_gesture
 
@@ -289,10 +294,10 @@ def update_gesture_controls(detected_gesture):
     if len(gesture_buffer) == GESTURE_HOLD and len(set(gesture_buffer)) == 1:
         stable = gesture_buffer[0]
         if stable and stable != last_triggered_gesture:
-            if stable == 'fist' and not is_paused:
+            if stable == 'thumbs_up' and not is_paused:
                 is_paused = True
                 gimbal_frozen = False
-                print("Fist -> PAUSED")
+                print("Thumbs Up -> PAUSED")
             elif stable == 'palm' and is_paused:
                 is_paused = False
                 print("Palm -> PLAYING")
@@ -313,7 +318,7 @@ def draw_gesture_hint(frame, detected_gesture):
         return
     h = frame.shape[0]
     labels = {
-        'fist': ("Gesture: FIST", (0, 0, 255)),
+        'thumbs_up': ("Gesture: THUMBS UP", (0, 0, 255)),
         'palm': ("Gesture: PALM", (0, 255, 0)),
         'peace': ("Gesture: PEACE", HUD_WARN),
     }
@@ -847,12 +852,26 @@ while cap.isOpened():
                     best_subject_score = subject_score
                     best_subject_id = track_id
 
-            # Keep the existing subject if still a valid facing candidate to reduce jumping.
+            # Keep the locked subject when still visible to reduce jumping.
             if subject_track_id in candidate_scores:
                 current_subject_score, current_facing_score = candidate_scores[subject_track_id]
-                if current_facing_score >= LOOKING_SCORE_THRESHOLD and current_subject_score >= best_subject_score - 0.07:
+                if current_facing_score >= LOOKING_SCORE_THRESHOLD:
+                    if current_subject_score >= (best_subject_score if best_subject_id is not None else -1.0) - 0.07:
+                        best_subject_id = subject_track_id
+                        best_subject_score = current_subject_score
+                elif best_subject_id is None:
+                    # Facing lock lost but this track ID is still in frame — keep it.
                     best_subject_id = subject_track_id
                     best_subject_score = current_subject_score
+
+            # No facing subject: fall back to locked ID or best available track.
+            if best_subject_id is None and candidate_scores:
+                if subject_track_id in candidate_scores:
+                    best_subject_id = subject_track_id
+                    best_subject_score = candidate_scores[subject_track_id][0]
+                else:
+                    best_subject_id = max(candidate_scores, key=lambda tid: candidate_scores[tid][0])
+                    best_subject_score = candidate_scores[best_subject_id][0]
 
             previous_subject_id = subject_track_id
             subject_track_id = best_subject_id

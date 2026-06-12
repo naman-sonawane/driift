@@ -1,7 +1,7 @@
 // ============================================================
 // DRIIFT - Auto-Tracking Camera Mount
 // Arduino Uno/Mega
-// Protocol: LEFT | RIGHT | SAFE | RESET | PING
+// Protocol: X:LEFT|RIGHT|SAFE  Y:UP|DOWN|SAFE  RESET  PING
 // ============================================================
 
 #include <LiquidCrystal.h>
@@ -22,31 +22,39 @@ const int LED_RED   = A2;
 const int SERVO_X_STOP = 92;
 const int SERVO_Y_STOP = 92;
 
-const int MOVE_SPEED = 3;        // PWM offset when pulsing (tune this: 2–5)
+const int MOVE_SPEED = 4;        // PWM offset when pulsing (tune this: 4–10)
 const unsigned long PULSE_DURATION_MS = 40;   // how long each pulse fires (tune this: 40–120ms)
 const unsigned long PULSE_COOLDOWN_MS = 90;  // mandatory stop gap between pulses
 
-unsigned long pulseStartTime = 0;
-bool inPulse = false;
+unsigned long pulseStartTimeX = 0;
+unsigned long pulseEndTimeX = 0;
+bool inPulseX = false;
 
-// Trim if one direction is weaker than the other.
-const int SERVO_X_LEFT_TRIM = 4;
-const int SERVO_X_RIGHT_TRIM = 0;
+unsigned long pulseStartTimeY = 0;
+unsigned long pulseEndTimeY = 0;
+bool inPulseY = false;
 
+// Extra delta beyond MOVE_SPEED — tune if one direction is still weak.
+const int SERVO_X_LEFT_EXTRA  = 2;
+const int SERVO_X_RIGHT_EXTRA = 2;
+const int SERVO_Y_UP_EXTRA    = 2;
+const int SERVO_Y_DOWN_EXTRA  = 2;
 
 const bool INVERT_X = false;
 const bool INVERT_Y = false;
 
 const unsigned long TIMEOUT_MS = 1500;
 
-enum Command { CMD_SAFE, CMD_LEFT, CMD_RIGHT };
+enum XCommand { X_SAFE, X_LEFT, X_RIGHT };
+enum YCommand { Y_SAFE, Y_UP, Y_DOWN };
 
 int pwmX = SERVO_X_STOP;
 int pwmY = SERVO_Y_STOP;
 int targetPwmX = SERVO_X_STOP;
 int targetPwmY = SERVO_Y_STOP;
 
-Command activeCmd = CMD_SAFE;
+XCommand activeXCmd = X_SAFE;
+YCommand activeYCmd = Y_SAFE;
 unsigned long lastMsg = 0;
 
 unsigned long lastLCDUpdate = 0;
@@ -58,38 +66,62 @@ void setLED(bool green, bool red)
     digitalWrite(LED_RED, red ? HIGH : LOW);
 }
 
-int pwmForCommand(Command cmd)
+int pwmForXCommand(XCommand cmd)
 {
-    if (cmd == CMD_SAFE)
+    if (cmd == X_SAFE)
     {
         return SERVO_X_STOP;
     }
 
-    int stop = SERVO_X_STOP;
-    int speed = MOVE_SPEED;
-
-    if (cmd == CMD_LEFT)
+    int delta = MOVE_SPEED;
+    if (cmd == X_LEFT)
     {
-        stop -= SERVO_X_LEFT_TRIM;
-        speed = -MOVE_SPEED;
+        delta += SERVO_X_LEFT_EXTRA;
+        delta = -delta;
     }
     else
     {
-        stop += SERVO_X_RIGHT_TRIM;
-        speed = MOVE_SPEED;
+        delta += SERVO_X_RIGHT_EXTRA;
     }
 
     if (INVERT_X)
     {
-        speed = -speed;
+        delta = -delta;
     }
 
-    return constrain(stop + speed, 0, 180);
+    return constrain(SERVO_X_STOP + delta, 0, 180);
+}
+
+int pwmForYCommand(YCommand cmd)
+{
+    if (cmd == Y_SAFE)
+    {
+        return SERVO_Y_STOP;
+    }
+
+    int delta = MOVE_SPEED;
+    if (cmd == Y_UP)
+    {
+        delta += SERVO_Y_UP_EXTRA;
+        delta = -delta;
+    }
+    else
+    {
+        delta += SERVO_Y_DOWN_EXTRA;
+    }
+
+    if (INVERT_Y)
+    {
+        delta = -delta;
+    }
+
+    return constrain(SERVO_Y_STOP + delta, 0, 180);
 }
 
 void stopMotors(bool immediate = false)
 {
-    activeCmd = CMD_SAFE;
+    activeXCmd = X_SAFE;
+    activeYCmd = Y_SAFE;
     targetPwmX = SERVO_X_STOP;
     targetPwmY = SERVO_Y_STOP;
 
@@ -102,27 +134,129 @@ void stopMotors(bool immediate = false)
     }
 }
 
-void applyCommand(Command cmd)
+void applyXCommand(XCommand cmd)
 {
-    activeCmd = cmd;
+    activeXCmd = cmd;
     lastMsg = millis();
 
-    // Only start a new pulse if we're not mid-cooldown
-    if (!inPulse) {
-        pulseStartTime = millis();
-        inPulse = true;
-        targetPwmX = pwmForCommand(cmd);
+    unsigned long now = millis();
+    bool coolingDown = pulseEndTimeX > 0 && (now - pulseEndTimeX) < PULSE_COOLDOWN_MS;
+
+    if (!inPulseX && !coolingDown)
+    {
+        pulseStartTimeX = now;
+        inPulseX = true;
+        targetPwmX = pwmForXCommand(cmd);
     }
-    targetPwmY = SERVO_Y_STOP;
 }
 
-const char* commandLabel(Command cmd)
+void applyYCommand(YCommand cmd)
+{
+    activeYCmd = cmd;
+    lastMsg = millis();
+
+    unsigned long now = millis();
+    bool coolingDown = pulseEndTimeY > 0 && (now - pulseEndTimeY) < PULSE_COOLDOWN_MS;
+
+    if (!inPulseY && !coolingDown)
+    {
+        pulseStartTimeY = now;
+        inPulseY = true;
+        targetPwmY = pwmForYCommand(cmd);
+    }
+}
+
+XCommand parseXCommand(const String& value)
+{
+    if (value == "LEFT")
+    {
+        return X_LEFT;
+    }
+    if (value == "RIGHT")
+    {
+        return X_RIGHT;
+    }
+    return X_SAFE;
+}
+
+YCommand parseYCommand(const String& value)
+{
+    if (value == "UP")
+    {
+        return Y_UP;
+    }
+    if (value == "DOWN")
+    {
+        return Y_DOWN;
+    }
+    return Y_SAFE;
+}
+
+void handleAxisCommand(const String& raw)
+{
+    int colonIdx = raw.indexOf(':');
+    if (colonIdx <= 0)
+    {
+        return;
+    }
+
+    String axis = raw.substring(0, colonIdx);
+    String value = raw.substring(colonIdx + 1);
+    value.trim();
+
+    if (axis == "X")
+    {
+        if (value == "SAFE")
+        {
+            activeXCmd = X_SAFE;
+            targetPwmX = SERVO_X_STOP;
+            inPulseX = false;
+            pulseEndTimeX = 0;
+            pwmX = SERVO_X_STOP;
+            servoX.write(SERVO_X_STOP);
+        }
+        else
+        {
+            applyXCommand(parseXCommand(value));
+        }
+        return;
+    }
+
+    if (axis == "Y")
+    {
+        if (value == "SAFE")
+        {
+            activeYCmd = Y_SAFE;
+            targetPwmY = SERVO_Y_STOP;
+            inPulseY = false;
+            pulseEndTimeY = 0;
+            pwmY = SERVO_Y_STOP;
+            servoY.write(SERVO_Y_STOP);
+        }
+        else
+        {
+            applyYCommand(parseYCommand(value));
+        }
+    }
+}
+
+const char* xCommandLabel(XCommand cmd)
 {
     switch (cmd)
     {
-        case CMD_LEFT:  return "LEFT ";
-        case CMD_RIGHT: return "RIGHT";
-        default:        return "SAFE ";
+        case X_LEFT:  return "L";
+        case X_RIGHT: return "R";
+        default:      return "-";
+    }
+}
+
+const char* yCommandLabel(YCommand cmd)
+{
+    switch (cmd)
+    {
+        case Y_UP:    return "U";
+        case Y_DOWN:  return "D";
+        default:      return "-";
     }
 }
 
@@ -166,20 +300,38 @@ void loop()
         if (raw == "SAFE" || raw == "LOST")
         {
             stopMotors(true);
-            inPulse = false;
+            inPulseX = false;
+            inPulseY = false;
+            pulseEndTimeX = 0;
+            pulseEndTimeY = 0;
         }
         else if (raw == "LEFT")
         {
-            applyCommand(CMD_LEFT);
+            applyXCommand(X_LEFT);
         }
         else if (raw == "RIGHT")
         {
-            applyCommand(CMD_RIGHT);
+            applyXCommand(X_RIGHT);
+        }
+        else if (raw == "UP")
+        {
+            applyYCommand(Y_UP);
+        }
+        else if (raw == "DOWN")
+        {
+            applyYCommand(Y_DOWN);
+        }
+        else if (raw.startsWith("X:") || raw.startsWith("Y:"))
+        {
+            handleAxisCommand(raw);
         }
         else if (raw == "RESET")
         {
             stopMotors(true);
-            inPulse = false;
+            inPulseX = false;
+            inPulseY = false;
+            pulseEndTimeX = 0;
+            pulseEndTimeY = 0;
             lastMsg = millis();
             Serial.println("ACK_RESET");
         }
@@ -196,42 +348,65 @@ void loop()
     if (now - lastMsg > TIMEOUT_MS)
     {
         stopMotors(true);
-        inPulse = false;
+        inPulseX = false;
+        inPulseY = false;
+        pulseEndTimeX = 0;
+        pulseEndTimeY = 0;
     }
 
-    // Pulse-and-stop logic
-    if (inPulse)
+    // Pulse-and-stop logic (independent per axis)
+    if (inPulseX)
     {
-        if (now - pulseStartTime >= PULSE_DURATION_MS)
+        if (now - pulseStartTimeX >= PULSE_DURATION_MS)
         {
-            inPulse = false;
+            inPulseX = false;
+            pulseEndTimeX = now;
             pwmX = SERVO_X_STOP;
-            pwmY = SERVO_Y_STOP;
             servoX.write(SERVO_X_STOP);
+        }
+        else
+        {
+            pwmX = targetPwmX;
+            servoX.write(targetPwmX);
+        }
+    }
+
+    if (inPulseY)
+    {
+        if (now - pulseStartTimeY >= PULSE_DURATION_MS)
+        {
+            inPulseY = false;
+            pulseEndTimeY = now;
+            pwmY = SERVO_Y_STOP;
             servoY.write(SERVO_Y_STOP);
         }
         else
         {
-            servoX.write(targetPwmX);
+            pwmY = targetPwmY;
             servoY.write(targetPwmY);
         }
     }
 
-    setLED(activeCmd != CMD_SAFE, activeCmd == CMD_SAFE);
+    bool tracking = activeXCmd != X_SAFE || activeYCmd != Y_SAFE || inPulseX || inPulseY;
+    setLED(tracking, !tracking);
 
     if (now - lastLCDUpdate >= LCD_INTERVAL)
     {
         lastLCDUpdate = now;
 
         lcd.setCursor(0, 0);
-        lcd.print(activeCmd == CMD_SAFE ? "Status: IDLE    " : "Status: TRACKING");
+        lcd.print(tracking ? "Status: TRACKING" : "Status: IDLE    ");
 
         lcd.setCursor(0, 1);
-        lcd.print("Cmd:");
-        lcd.print(commandLabel(activeCmd));
-        lcd.print(" X:");
+        lcd.print("X:");
+        lcd.print(xCommandLabel(activeXCmd));
+        lcd.print(" Y:");
+        lcd.print(yCommandLabel(activeYCmd));
+        lcd.print(" ");
         lcd.print(pwmX);
-        lcd.print("   ");
+        lcd.print("/");
+        lcd.print(pwmY);
+        lcd.print(" ");
     }
 
     delay(10);
